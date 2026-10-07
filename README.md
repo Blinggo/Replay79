@@ -1,3 +1,44 @@
+## Addendum: Phase 2.1 — Persistent Identity Manager (`identity.py`)
+
+A new, self-contained module, `identity.py`, has been added alongside the
+Phase 1 files. **It is not yet wired into `probe.py`, `ui.py`, or
+`__init__.py`** — it introduces no new classes to register and changes no
+Phase 1 behavior. It exists to be consumed by the Phase 2.2 recording
+pipeline once that is built.
+
+**What it does:** assigns a persistent UUID to every Blender `Object`
+(`obj["replay79_uid"]`) and every `Mesh` datablock
+(`mesh["replay79_mesh_uid"]`) using ordinary custom ID properties, so the
+IDs are saved into the `.blend` file and survive rename and reload — unlike
+Phase 1's `obj.as_pointer()`, which is only a valid identity for the
+lifetime of the current Blender process and is **not** used for anything
+persistent.
+
+**Why this is needed:** Blender's `obj.copy()` / `mesh.copy()` duplicate
+*all* custom properties, including our own identity property. Immediately
+after a duplicate/copy, both the original and the copy report the same
+UID — so merely having a `replay79_uid` is not proof of a valid, unique
+identity. `identity.py` builds a whole-file registry of currently-known
+UIDs on every scan and repairs collisions: the first datablock encountered
+keeps its UID, any later datablock found holding the same UID is
+reassigned a fresh one. Existing, non-colliding UIDs are always preserved
+exactly as-is (the manager is idempotent).
+
+**Shared mesh datablocks are explicitly not a collision.** If two
+different Objects legitimately reference the *same* Mesh datablock (e.g. a
+linked duplicate), that one Mesh keeps exactly one `replay79_mesh_uid`,
+while the two Objects still get two different `replay79_uid` values. The
+manager distinguishes "two objects, one shared mesh" (valid) from "two
+different meshes that happen to hold the same UID string because one was
+copied from the other" (a collision to repair) by checking datablock
+identity, not just the property value.
+
+See `identity.py`'s module docstring and `Phase2_Architecture.md` §3 for
+further detail, and the end of this file is unaffected — Phase 1's
+diagnostic probe, counters, and UI are unchanged by this addition.
+
+---
+
 # ReplayProbe79 — Phase 1 Diagnostic Probe
 
 Part of the long-term **ReplayMod79** project: a Blender addon, conceptually

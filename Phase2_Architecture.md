@@ -237,6 +237,18 @@ This is the most load-bearing part of the design, so it's specified
 concretely.
 
 ### Identity
+
+> **Status update (P2.1, implemented):** the identity scheme described in
+> this subsection has been implemented in `identity.py` and verified
+> against synthetic (non-Blender) tests covering: new-object UID
+> assignment, rename stability, `obj.copy()`/`mesh.copy()` collision
+> repair, shared-mesh non-collision, idempotency across repeated scans,
+> and manually-forced duplicate-UID repair. Manual verification inside a
+> real Blender 2.79b session (including an actual `.blend` save/reload
+> round-trip) is still pending — see the P2.1 final report. No recording,
+> SQLite, event, checkpoint, or reconstruction code exists yet; this
+> remains strictly the identity layer described below.
+
 - Every `Mesh` datablock gets a **persistent UID** the first time the
   recorder sees it: a `uuid.uuid4().hex` string stored as a Blender
   **custom ID property** directly on the datablock, e.g.
