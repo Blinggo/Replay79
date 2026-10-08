@@ -8,6 +8,9 @@ Responsible for:
     * A modal-operator timer used as a periodic fallback/heartbeat.
     * Collecting observations (counters + bounded event log) produced by
       snapshot.diff_snapshots().
+    * Exposing a generic add_event_listener()/remove_event_listener() hook
+      (added for Phase 2.2) so other modules -- currently recording.py --
+      can observe the same detected events without a second handler.
 
 Design notes / Blender 2.79 constraints honoured here:
 
@@ -95,6 +98,39 @@ _last_object = "(none)"
 _last_mesh = "(none)"
 _scene_snapshots = {}   # scene_name -> snapshot dict
 _busy = False           # re-entrancy guard
+
+# ---------------------------------------------------------------------------
+# Event listener hook (added for Phase 2.2 -- see recording.py)
+# ---------------------------------------------------------------------------
+# Phase 2.2 needs to observe the same detected-change events Phase 1 already
+# computes, WITHOUT installing a second scene_update_post handler. Rather
+# than hard-coding a dependency on recording.py here (which would invert
+# the module layering), probe.py exposes a tiny, generic observer list:
+# any module may register a callback(scene, event_dict) and will be called
+# once per detected event, right after Phase 1's own counters/log are
+# updated. A listener exception is caught and logged here so a bug in a
+# *subscriber* (e.g. the recording state machine) can never break Phase 1
+# detection itself.
+_event_listeners = []
+
+
+def add_event_listener(callback):
+    """Register `callback(scene, event_dict)` to be invoked once per
+    detected change event. Safe to call multiple times with the same
+    callback (it will not be added twice).
+    """
+    if callback not in _event_listeners:
+        _event_listeners.append(callback)
+
+
+def remove_event_listener(callback):
+    """Unregister a previously added callback. Safe to call even if the
+    callback was never registered / already removed.
+    """
+    try:
+        _event_listeners.remove(callback)
+    except ValueError:
+        pass
 
 
 def is_running():
@@ -213,6 +249,9 @@ def shutdown():
     _running = False
     _remove_handler()
     clear()
+    # Detach any Phase 2.2+ subscribers too -- on a full addon unregister
+    # nothing should keep a stale reference into this module's state.
+    _event_listeners[:] = []
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +325,12 @@ def _process_scene(scene, now):
         if mesh_name:
             _last_mesh = mesh_name
         _log_event(ev['type'], ev.get('object', '?'), ev.get('detail'))
+
+        for listener in tuple(_event_listeners):
+            try:
+                listener(scene, ev)
+            except Exception as exc:
+                print(ADDON_TAG + ": event listener error (ignored): %s" % exc)
 
 
 # ---------------------------------------------------------------------------

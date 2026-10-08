@@ -1,9 +1,20 @@
 # ReplayMod79 — Phase 2 Architecture Proposal
 ### (Recording / Reconstruction Design — Pre-Implementation Review)
 
-Status: **Design only.** No Phase 2 code exists yet. Phase 1 (`ReplayProbe79`)
-remains unmodified. This document is the basis for deciding what Phase 2
-should actually build.
+Status: **Design document; implementation now in progress.** This document
+remains the basis for the *full* future recorder design described below
+(SQLite storage, checkpoints, event encoding, reconstruction, camera,
+FFmpeg — none of that exists yet). Two early, independently-scoped
+slices of it have since been implemented ahead of the rest, each with
+its own status note inline where relevant: **Phase 2.1** (the identity
+layer described in §3, `identity.py` — complete and verified, including
+inside real Blender 2.79b) and **Phase 2.2**, now the current
+implementation phase (a lightweight, in-memory Start/Stop recording
+*lifecycle* around Phase 1's existing detector — `recording.py` — which
+deliberately implements only a thin slice of the full §16 M3/M4
+milestones: no SQLite, no checkpoints, no event persistence, no
+reconstruction yet). Phase 1 (`ReplayProbe79`'s `probe.py`/`snapshot.py`)
+remains functionally unmodified by both.
 
 Correction for the record: Blender 2.79b bundles **Python 3.5.3**, not
 Python 2.x. `array`, `zlib`, `sqlite3`, and `uuid` are all standard-library
@@ -238,16 +249,28 @@ concretely.
 
 ### Identity
 
-> **Status update (P2.1, implemented):** the identity scheme described in
-> this subsection has been implemented in `identity.py` and verified
-> against synthetic (non-Blender) tests covering: new-object UID
-> assignment, rename stability, `obj.copy()`/`mesh.copy()` collision
-> repair, shared-mesh non-collision, idempotency across repeated scans,
-> and manually-forced duplicate-UID repair. Manual verification inside a
-> real Blender 2.79b session (including an actual `.blend` save/reload
-> round-trip) is still pending — see the P2.1 final report. No recording,
-> SQLite, event, checkpoint, or reconstruction code exists yet; this
-> remains strictly the identity layer described below.
+> **Status update (P2.1, implemented and verified):** the identity scheme
+> described in this subsection has been implemented in `identity.py` and
+> verified both against synthetic (non-Blender) tests covering:
+> new-object UID assignment, rename stability, `obj.copy()`/`mesh.copy()`
+> collision repair, shared-mesh non-collision, idempotency across
+> repeated scans, and manually-forced duplicate-UID repair — **and**
+> inside a real Blender 2.79b session (including an actual `.blend`
+> save/reload round-trip). P2.1 is complete; this is no longer pending.
+>
+> **Status update (P2.2, in progress):** a new module, `recording.py`,
+> now *consumes* this identity layer: `identity.ensure_all_identities()`
+> and `identity.validate_scene_identities()` are called when a recording
+> session starts, and every in-memory recording-session event attaches
+> the affected object's/mesh's persistent UID where available. P2.2 is a
+> lightweight Start/Stop recording **lifecycle/state machine**
+> (`STOPPED -> ARMING -> RECORDING -> STOPPING -> STOPPED`) with an
+> in-memory-only baseline and per-session event log — it is explicitly
+> NOT the SQLite-backed recording pipeline described in §2/§4/§5/§6 of
+> this document (no `.rm79` file, no checkpoints, no persisted events,
+> no reconstruction). Those remain future work (§16, M2 onward). No
+> other recording/SQLite/event/checkpoint/reconstruction code exists
+> yet.
 
 - Every `Mesh` datablock gets a **persistent UID** the first time the
   recorder sees it: a `uuid.uuid4().hex` string stored as a Blender

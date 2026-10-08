@@ -15,6 +15,7 @@ the WindowManager *class*, which is always available.
 import bpy
 
 from . import probe
+from . import recording
 
 
 COUNTER_LABELS = (
@@ -58,9 +59,38 @@ class REPLAYPROBE79_PT_panel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="Status")
-        box.label(text="Monitoring: %s" % ("YES" if status['running'] else "NO"))
+        box.label(text="Probe: %s" % ("Monitoring" if status['running'] else "Stopped"))
         box.label(text="Elapsed: %.1fs" % status['elapsed'])
         box.label(text="Scenes tracked: %d" % status['scene_count'])
+
+        layout.separator()
+
+        # Recording (Phase 2.2) -- deliberately its own, visually distinct
+        # box. "Probe: Monitoring" above and "Recording: STOPPED" below is
+        # a valid, expected combination: Phase 1 diagnostics can run with
+        # no recording session active at all.
+        rec_status = recording.get_status()
+
+        rbox = layout.box()
+        rbox.label(text="Recording (Phase 2.2)")
+        row = rbox.row(align=True)
+        row.operator("replayprobe79.start_recording", text="Start Recording")
+        row.operator("replayprobe79.stop_recording", text="Stop Recording")
+        rbox.operator("replayprobe79.clear_recording", text="Clear Last Session")
+
+        rbox.label(text="Recording: %s" % rec_status['state'])
+        rbox.label(text="Recording Time: %.1fs" % rec_status['elapsed'])
+        rbox.label(text="Sequence: %d" % rec_status['sequence'])
+        rbox.label(text="Events logged: %d" % rec_status['log_count'])
+        rbox.label(text=rec_status['last_message'])
+        if not rec_status['probe_running'] and rec_status['state'] == recording.STATE_RECORDING:
+            rbox.label(text="Warning: Probe is stopped -- no new events "
+                             "are being captured!", icon='ERROR')
+
+        rbox2 = layout.box()
+        rbox2.label(text="Recording counters (current/last session):")
+        for key, label in COUNTER_LABELS:
+            rbox2.label(text="%s: %d" % (label, rec_status['counters'].get(key, 0)))
 
         box = layout.box()
         box.label(text="Counters:")

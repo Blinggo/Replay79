@@ -1,10 +1,62 @@
+## Addendum: Phase 2.2 — Recording State Machine (`recording.py`)
+
+A new module, `recording.py`, adds a minimal **Start/Stop recording
+lifecycle** around Phase 1's existing detector, now registered and wired
+into `__init__.py` and `ui.py`. **This is not the full future recorder**
+(no `.rm79` file, no SQLite, no persisted events, no replay — see
+`docs/Phase2_Architecture.md`): it only tracks, in memory, "is a
+recording session currently active, and what has it observed so far."
+
+**State machine:** one authoritative state value —
+`STOPPED -> ARMING -> RECORDING -> STOPPING -> STOPPED` — never scattered
+booleans. **Start Recording** calls `identity.ensure_all_identities()`
+then `identity.validate_scene_identities()`; if identities are invalid it
+reports why and returns safely to `STOPPED` without ever claiming a
+recording started. On success it captures a one-time, in-memory baseline
+(reusing `snapshot.snapshot_scene()` plus a cheap persistent-UID lookup
+per object/mesh via `identity.py` — no new geometry-scanning code), resets
+the session's sequence counter/clock/statistics, makes sure Phase 1's
+probe is actually running (`probe.start()`, a no-op if already running —
+recording without an active detector would silently capture nothing),
+and subscribes to Phase 1's events via a new generic
+`probe.add_event_listener()` hook (**not** a second `scene_update_post`
+handler). **Stop Recording** unsubscribes, freezes the recording clock,
+and keeps the finished session's statistics/log available for diagnostics
+until the next recording starts or "Clear Last Session" is pressed.
+
+**Recording Time** is measured by a small `RecordingClock` abstraction
+using `time.monotonic()` (not `bpy.app.timers`, which is 2.80+, and not
+raw `time.time()` calls scattered around, which could jump if the system
+clock changes) — `recording_time = now - start_time`, frozen once
+stopped. It already has working (if currently unused) `pause()`/`resume()`
+methods so a future `PAUSED` state can be added without reworking
+time-keeping.
+
+**"Probe: Monitoring" and "Recording: STOPPED" are independent, and both
+valid at once** — the UI panel deliberately shows them as two separate
+boxes. A known, accepted limitation: if you manually press "Stop Probe"
+while a recording session is `RECORDING`, the session silently stops
+receiving new events (nothing feeds it anymore) but its state does not
+automatically change; the UI's probe/recording split is intended to make
+that situation visible rather than hidden.
+
+Explicitly **not** implemented in P2.2 (future work, see
+`docs/Phase2_Architecture.md`): SQLite/`.rm79` persistence, mesh delta or
+topology encoding, checkpoints, replay reconstruction, camera, FFmpeg.
+
+See `recording.py`'s module docstring for full design rationale.
+
+---
+
 ## Addendum: Phase 2.1 — Persistent Identity Manager (`identity.py`)
 
-A new, self-contained module, `identity.py`, has been added alongside the
-Phase 1 files. **It is not yet wired into `probe.py`, `ui.py`, or
-`__init__.py`** — it introduces no new classes to register and changes no
-Phase 1 behavior. It exists to be consumed by the Phase 2.2 recording
-pipeline once that is built.
+A new, self-contained module, `identity.py`, was added alongside the
+Phase 1 files. It introduces no new classes to register and changes no
+Phase 1 behavior. **As of Phase 2.2 it is actively consumed**: every
+Start Recording call runs `identity.ensure_all_identities()` and
+`identity.validate_scene_identities()` (see the addendum above), and
+every in-memory recording event attaches the affected object's/mesh's
+persistent UID where available.
 
 **What it does:** assigns a persistent UUID to every Blender `Object`
 (`obj["replay79_uid"]`) and every `Mesh` datablock
@@ -83,7 +135,11 @@ ReplayProbe79/
                      counters, bounded event log
     snapshot.py      pure-data scene/object/mesh snapshotting + diffing
                      (no bpy.context dependency, no Blender handler code)
-    ui.py            the single diagnostic Panel + WindowManager property
+    identity.py      (Phase 2.1) persistent object/mesh UUIDs via custom
+                     ID properties, collision detection/repair
+    recording.py     (Phase 2.2) Start/Stop recording state machine,
+                     in-memory session baseline/clock/event log
+    ui.py            the diagnostic Panel (Probe status + Recording status)
     README.md        this file
 ```
 
@@ -151,7 +207,23 @@ Event log (most recent last, showing up to 15):
 [12.31] OBJECT_CREATED Cube
 [15.72] TRANSFORM_CHANGED Cube
 ...
+
+Recording (Phase 2.2)
+[ Start Recording ] [ Stop Recording ]
+[ Clear Last Session ]
+Recording: STOPPED / ARMING / RECORDING / STOPPING
+Recording Time: ...s
+Sequence: ...
+Events logged: ...
+(status message)
+
+Recording counters (current/last session):
+... (same categories as the Probe counters above, scoped to the
+    recording session instead of since Start Probe)
 ```
+
+See the "Phase 2.2" addendum at the top of this file for what the
+Recording section does and does not do.
 
 ---
 

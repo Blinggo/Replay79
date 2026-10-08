@@ -38,10 +38,11 @@ bl_info = {
 import bpy
 
 from . import probe
+from . import recording
 from . import ui
 
 
-ALL_CLASSES = tuple(probe.PROBE_CLASSES) + tuple(ui.UI_CLASSES)
+ALL_CLASSES = tuple(probe.PROBE_CLASSES) + tuple(recording.RECORDING_CLASSES) + tuple(ui.UI_CLASSES)
 
 
 def register():
@@ -54,11 +55,17 @@ def register():
     # start from a clean slate. This only touches bpy.app.handlers, a
     # plain list, never bpy.context.
     probe._remove_handler()
+    # Same defensive reasoning for Phase 2.2: never start up already
+    # believing a recording session is active.
+    recording.shutdown()
 
 
 def unregister():
     # Make sure monitoring is fully stopped and handlers detached before
-    # classes disappear.
+    # classes disappear. Order does not matter: recording.shutdown() only
+    # detaches its own probe listener/clock, it does not depend on probe
+    # still being registered.
+    recording.shutdown()
     probe.shutdown()
 
     ui._unregister_properties()
