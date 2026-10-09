@@ -4,17 +4,22 @@
 Status: **Design document; implementation now in progress.** This document
 remains the basis for the *full* future recorder design described below
 (SQLite storage, checkpoints, event encoding, reconstruction, camera,
-FFmpeg — none of that exists yet). Two early, independently-scoped
+FFmpeg — none of that exists yet). Three early, independently-scoped
 slices of it have since been implemented ahead of the rest, each with
 its own status note inline where relevant: **Phase 2.1** (the identity
 layer described in §3, `identity.py` — complete and verified, including
-inside real Blender 2.79b) and **Phase 2.2**, now the current
-implementation phase (a lightweight, in-memory Start/Stop recording
-*lifecycle* around Phase 1's existing detector — `recording.py` — which
-deliberately implements only a thin slice of the full §16 M3/M4
+inside real Blender 2.79b), **Phase 2.2** (a lightweight, in-memory
+Start/Stop recording *lifecycle* around Phase 1's existing detector —
+`recording.py` — complete and verified inside real Blender 2.79b), and
+**Phase 2.3A**, now the current implementation phase (a normalized,
+in-memory event schema + conservative transform coalescing — `events.py`,
+plus pointer-based UID resolution in `recording.py`). All three
+deliberately implement only a thin slice of the full §4/§16 M2/M3/M4
 milestones: no SQLite, no checkpoints, no event persistence, no
-reconstruction yet). Phase 1 (`ReplayProbe79`'s `probe.py`/`snapshot.py`)
-remains functionally unmodified by both.
+reconstruction yet. Phase 1 (`ReplayProbe79`'s `probe.py`/`snapshot.py`)
+remains functionally unmodified by all three (snapshot.py's
+`diff_snapshots()` gained additive fields only — see the P2.3A status
+note in §3/§4 — its existing fields/behavior are unchanged).
 
 Correction for the record: Blender 2.79b bundles **Python 3.5.3**, not
 Python 2.x. `array`, `zlib`, `sqlite3`, and `uuid` are all standard-library
@@ -258,19 +263,36 @@ concretely.
 > inside a real Blender 2.79b session (including an actual `.blend`
 > save/reload round-trip). P2.1 is complete; this is no longer pending.
 >
-> **Status update (P2.2, in progress):** a new module, `recording.py`,
-> now *consumes* this identity layer: `identity.ensure_all_identities()`
-> and `identity.validate_scene_identities()` are called when a recording
-> session starts, and every in-memory recording-session event attaches
-> the affected object's/mesh's persistent UID where available. P2.2 is a
-> lightweight Start/Stop recording **lifecycle/state machine**
+> **Status update (P2.2, implemented and verified):** a new module,
+> `recording.py`, *consumes* this identity layer:
+> `identity.ensure_all_identities()` and `identity.validate_scene_identities()`
+> are called when a recording session starts. P2.2 is a lightweight
+> Start/Stop recording **lifecycle/state machine**
 > (`STOPPED -> ARMING -> RECORDING -> STOPPING -> STOPPED`) with an
-> in-memory-only baseline and per-session event log — it is explicitly
-> NOT the SQLite-backed recording pipeline described in §2/§4/§5/§6 of
-> this document (no `.rm79` file, no checkpoints, no persisted events,
-> no reconstruction). Those remain future work (§16, M2 onward). No
-> other recording/SQLite/event/checkpoint/reconstruction code exists
-> yet.
+> in-memory-only baseline and per-session event bookkeeping — it is
+> explicitly NOT the SQLite-backed recording pipeline described in
+> §2/§4/§5/§6 of this document (no `.rm79` file, no checkpoints, no
+> persisted events, no reconstruction). P2.2 is complete and validated in
+> real Blender 2.79b.
+>
+> **Status update (P2.3A, in progress):** a new module, `events.py`,
+> defines the **normalized, plain-Python-data event schema** (schema
+> version 1 — see its module docstring) this document's future §4 "Event
+> Representation" is expected to eventually persist, plus a small,
+> conservative coalescer (consecutive `TRANSFORM_CHANGED` observations
+> for the same object within a 0.25s sliding window merge into one stored
+> record; every other event type remains one-for-one). `snapshot.py`'s
+> `diff_snapshots()` now additionally emits a transient
+> `object_pointer`/`mesh_pointer` (`as_pointer()`) alongside each event,
+> used ONLY as a session-local lookup key by `recording.py`'s new
+> pointer->UID maps — never stored as persistent identity, and never
+> appearing in a normalized event (which only ever carries the resolved
+> `object_uid`/`mesh_uid` string or `None`). This specifically fixes a
+> P2.2 gap: `OBJECT_DELETED` events can now carry a correct, non-null
+> `object_uid` even though the deleted object no longer exists to look up
+> by name. P2.3A remains, like P2.2, an in-memory-only layer — still NOT
+> the SQLite/`.rm79` pipeline described below. No persistence, checkpoint,
+> reconstruction, camera, or FFmpeg code exists yet.
 
 - Every `Mesh` datablock gets a **persistent UID** the first time the
   recorder sees it: a `uuid.uuid4().hex` string stored as a Blender
@@ -369,6 +391,21 @@ No special-cased detection of "this was a big operation" — instead, a
 ---
 
 ## 4. Proposed Event Representation
+
+> **Status update (P2.3A, in progress):** an early, in-memory-only,
+> non-persisted precursor of this envelope now exists in `events.py`
+> (schema version 1): `{schema, seq, t, scene_name, type, object_uid,
+> mesh_uid, object_name, mesh_name, payload, sample_count}`. It
+> deliberately differs from the `target_uid`/compressed-`bytes`/`checksum`
+> shape below in ways appropriate to an in-memory stage that has no
+> disk format yet: `object_uid`/`mesh_uid` are kept as two separate
+> fields rather than one `target_uid` (simpler resolution, see §3's P2.3A
+> note), `payload` is a plain dict (not yet encoded/compressed bytes),
+> and there is no `checksum` (nothing is written to disk yet, so there is
+> nothing to protect against storage-media corruption). When the SQLite
+> storage layer described in §6 is eventually built, `events.py`'s schema
+> is the intended starting point for the on-disk envelope, not a
+> replacement for this design.
 
 A single, uniform envelope for every event, so the storage/reader code
 doesn't need per-type special cases beyond payload parsing:

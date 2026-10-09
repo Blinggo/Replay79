@@ -280,8 +280,38 @@ def snapshot_scene(scene):
 def diff_snapshots(old, new):
     """Compare two scene snapshots and return a list of event dicts.
 
-    Each event dict has at least: 'type', 'object'. It may also have
-    'detail' (human readable extra info) and 'mesh_name'.
+    Each event dict has at least: 'type', 'object'. It also carries (added
+    for Phase 2.3A, see events.py / recording.py):
+
+        'object_pointer' -- obj.as_pointer() of the affected object, or
+                             None. SESSION-LOCAL / TRANSIENT ONLY -- this
+                             is a lookup key for resolving a persistent
+                             identity.py UID while the object still (or
+                             very recently) existed; it is never meant to
+                             be stored as a persistent identity itself.
+                             For OBJECT_DELETED specifically, this is the
+                             pointer the object had *before* it vanished,
+                             which is exactly what lets a subscriber like
+                             recording.py resolve "which UID was this"
+                             from a pointer->UID map populated while the
+                             object was still alive -- a name lookup
+                             against bpy.data.objects would fail for a
+                             deleted object, which is the whole reason
+                             this field exists.
+        'mesh_pointer'    -- same idea, for the affected Mesh datablock
+                              (mesh.as_pointer()), or None for non-mesh
+                              events/objects.
+        'payload'         -- a small, type-specific plain dict containing
+                              enough already-computed state (from the
+                              snapshot records below) to build a useful
+                              normalized event payload one layer up, in
+                              events.py / recording.py. This deliberately
+                              reuses data snapshot_object()/mesh_signature()
+                              already computed -- nothing here re-reads
+                              bpy or recomputes a mesh signature.
+
+    It may also have 'detail' (human readable extra info, used only for
+    probe.py's plain-text event log line) and 'mesh_name'.
     """
     events = []
 
@@ -300,7 +330,24 @@ def diff_snapshots(old, new):
         events.append({
             'type': 'OBJECT_CREATED',
             'object': rec['name'],
+            'object_pointer': rec.get('pointer'),
             'mesh_name': rec.get('data_name'),
+            'mesh_pointer': rec.get('data_pointer'),
+            'payload': {
+                'object_type': rec.get('type'),
+                'name': rec.get('name'),
+                'location': rec.get('location'),
+                'rotation': rec.get('rotation'),
+                'scale': rec.get('scale'),
+                'hide': rec.get('hide'),
+                'hide_render': rec.get('hide_render'),
+                'select': rec.get('select'),
+                'mode': rec.get('mode'),
+                'data_name': rec.get('data_name'),
+                'materials': rec.get('materials'),
+                'modifiers': rec.get('modifiers'),
+                'mesh_signature': rec.get('mesh'),
+            },
         })
 
     for p in deleted:
@@ -308,62 +355,114 @@ def diff_snapshots(old, new):
         events.append({
             'type': 'OBJECT_DELETED',
             'object': rec['name'],
+            'object_pointer': rec.get('pointer'),
             'mesh_name': rec.get('data_name'),
+            'mesh_pointer': rec.get('data_pointer'),
+            'payload': {
+                'object_type': rec.get('type'),
+                'old_name': rec.get('name'),
+                'location': rec.get('location'),
+                'rotation': rec.get('rotation'),
+                'scale': rec.get('scale'),
+                'hide': rec.get('hide'),
+                'hide_render': rec.get('hide_render'),
+                'data_name': rec.get('data_name'),
+            },
         })
 
     for p in common:
         o = old_objects[p]
         n = new_objects[p]
+        obj_ptr = n.get('pointer')
+        mesh_ptr = n.get('data_pointer')
 
         if o['name'] != n['name']:
             events.append({
                 'type': 'OBJECT_RENAMED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
                 'detail': 'was ' + o['name'],
+                'payload': {'old_name': o['name'], 'new_name': n['name']},
             })
 
         if o['location'] != n['location'] or o['rotation'] != n['rotation'] or o['scale'] != n['scale']:
             events.append({
                 'type': 'TRANSFORM_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {
+                    'location': n['location'],
+                    'rotation': n['rotation'],
+                    'scale': n['scale'],
+                },
             })
 
         if o['hide'] != n['hide'] or o['hide_render'] != n['hide_render']:
             events.append({
                 'type': 'VISIBILITY_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {'hide': n['hide'], 'hide_render': n['hide_render']},
             })
 
         if o['select'] != n['select']:
             events.append({
                 'type': 'SELECTION_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {'select': n['select']},
             })
 
         if o['mode'] != n['mode']:
             events.append({
                 'type': 'MODE_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
                 'detail': o['mode'] + ' -> ' + n['mode'],
+                'payload': {'old_mode': o['mode'], 'new_mode': n['mode']},
             })
 
         if o['data_pointer'] != n['data_pointer']:
             events.append({
                 'type': 'OBJECT_DATA_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
                 'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {
+                    'data_name': n.get('data_name'),
+                    'mesh_signature': n.get('mesh'),
+                },
             })
 
         if o['materials'] != n['materials']:
             events.append({
                 'type': 'MATERIAL_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {'materials': n['materials']},
             })
 
         if o['modifiers'] != n['modifiers']:
             events.append({
                 'type': 'MODIFIER_CHANGED',
                 'object': n['name'],
+                'object_pointer': obj_ptr,
+                'mesh_name': n.get('data_name'),
+                'mesh_pointer': mesh_ptr,
+                'payload': {'modifiers': n['modifiers']},
             })
 
         om = o.get('mesh')
@@ -375,19 +474,29 @@ def diff_snapshots(old, new):
                 events.append({
                     'type': 'TOPOLOGY_CHANGED',
                     'object': n['name'],
+                    'object_pointer': obj_ptr,
                     'mesh_name': n.get('data_name'),
+                    'mesh_pointer': mesh_ptr,
+                    'payload': {'mesh_signature': nm},
                 })
             elif om['vert_checksum'] != nm['vert_checksum']:
                 events.append({
                     'type': 'MESH_GEOMETRY_CHANGED',
                     'object': n['name'],
+                    'object_pointer': obj_ptr,
                     'mesh_name': n.get('data_name'),
+                    'mesh_pointer': mesh_ptr,
+                    'payload': {'mesh_signature': nm},
                 })
 
     if old.get('active_pointer') != new.get('active_pointer'):
         events.append({
             'type': 'ACTIVE_OBJECT_CHANGED',
             'object': new.get('active_name') or '(none)',
+            'object_pointer': new.get('active_pointer'),
+            'mesh_name': None,
+            'mesh_pointer': None,
+            'payload': {'active_object_name': new.get('active_name')},
         })
 
     return events

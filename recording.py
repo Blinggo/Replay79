@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-recording.py -- Replay79 Phase 2.2: Recording Lifecycle / State Machine
+recording.py -- Replay79 Phase 2.2/2.3A: Recording Lifecycle + Event
+Normalization
 
 Responsible for:
     * The Start Recording / Stop Recording state machine:
@@ -9,19 +10,63 @@ Responsible for:
       arbitrary wall-clock time), structured so a future PAUSED state can
       exclude paused time without rewriting this module.
     * A single in-memory RecordingSession: a baseline scene snapshot taken
-      at Start, plus lightweight per-event bookkeeping (sequence number,
-      recording-relative timestamp, change category, and the affected
-      object/mesh's persistent Replay79 UID where available) for every
-      change Phase 1 detects while the session is RECORDING.
+      at Start, plus a bounded log of NORMALIZED events (see events.py)
+      -- each with a stable sequence number, a recording-relative
+      timestamp, and the affected object's/mesh's persistent identity.py
+      UID where available, including for OBJECT_DELETED (Phase 2.3A --
+      see "Session identity maps" below).
+    * (Phase 2.3A) Resolving each raw probe.py event's transient
+      obj.as_pointer()/mesh.as_pointer() into a persistent identity.py
+      UID via small, session-local pointer->UID maps, and handing the
+      result to events.py for normalization + conservative coalescing.
 
-Responsible for NOT doing (explicitly out of scope for Phase 2.2 -- see
-docs/Phase2_Architecture.md for where these belong):
+Responsible for NOT doing (explicitly out of scope for Phase 2.2/2.3A --
+see docs/Phase2_Architecture.md for where these belong):
     * SQLite / .rm79 file creation.
     * Mesh delta/topology encoding, checkpoint serialization.
     * Replay reconstruction / VirtualScene / camera / FFmpeg.
     * A second scene_update_post handler -- this module is a *subscriber*
       to probe.py's existing detection pipeline (see probe.add_event_listener),
       never an independent detector.
+
+-------------------------------------------------------------------------
+Session identity maps (Phase 2.3A)
+-------------------------------------------------------------------------
+P2.2's `_on_probe_event` resolved an object's UID with
+`bpy.data.objects.get(obj_name)` -- which cannot work for OBJECT_DELETED,
+because the object no longer exists to look up by name by the time the
+event arrives. Phase 2.3A fixes this with two small, session-local
+dicts, `_object_uid_by_pointer` / `_mesh_uid_by_pointer`, keyed by the
+*transient* `obj.as_pointer()`/`mesh.as_pointer()` values that
+snapshot.diff_snapshots() now includes on every event (see snapshot.py).
+These pointers are SESSION-LOCAL LOOKUP KEYS ONLY -- never written into
+a normalized event; the normalized event only ever carries the resolved
+persistent `object_uid`/`mesh_uid` string (or None).
+
+The maps are populated once from the baseline at Start (every object/mesh
+present when recording begins), and kept up to date incrementally:
+    * OBJECT_CREATED is the only event type allowed to run the
+      comparatively expensive `identity.ensure_all_identities()` repair
+      scan (a cheap, custom-ID-property-only scan -- no geometry -- but
+      still O(all objects/meshes), so it must not run on every event).
+      Immediately afterwards a cheap property-only pass refreshes both
+      maps from the now-correct (collision-repaired) state. This is what
+      makes a duplicated object (which starts out holding a *colliding*
+      copy of the original's UID) end up correctly mapped to its own,
+      newly-repaired UID rather than the original's.
+    * Every other event type resolves via an O(1) pointer dict lookup
+      first; only if that misses does it fall back to a single, cheap,
+      geometry-free `bpy.data.objects.get(name)` / `.meshes.get(name)` +
+      `identity.get_object_uid()/get_mesh_uid()` call (property reads
+      only), backfilling the map for next time. OBJECT_DELETED never
+      takes this fallback path at all (the object is already gone), so
+      its UID can ONLY come from the pointer map -- which is exactly why
+      the map must be populated proactively rather than lazily.
+    * On OBJECT_DELETED, once the delete event has been normalized, the
+      object's entry is removed from `_object_uid_by_pointer` (the mesh
+      entry is deliberately NOT removed -- deleting an object does not
+      delete its mesh datablock in Blender; it may still be referenced
+      elsewhere or simply linger as a 0-user datablock).
 
 -------------------------------------------------------------------------
 Relationship to Phase 1 (probe.py) and Phase 2.1 (identity.py)
@@ -67,6 +112,7 @@ import bpy
 from . import probe
 from . import snapshot
 from . import identity
+from . import events
 
 
 ADDON_TAG = "ReplayProbe79"
@@ -174,9 +220,23 @@ class RecordingSession(object):
         self.started_wall = None     # time.time(), for human-readable display only
         self.stopped_wall = None
         self.final_elapsed = None    # frozen clock reading, set at Stop
-        self.log = []                # bounded list of lightweight event dicts
+        self.log = []                # bounded list of NORMALIZED event dicts (events.py)
         self.counters = dict((k, 0) for k in probe.COUNTER_KEYS)
         self.error = None            # last internal error, if any (diagnostics)
+
+        # --- Phase 2.3A: normalized-event bookkeeping ---------------------
+        self.coalescer = events.Coalescer()
+        # Raw: every detector observation handed to _on_probe_event, before
+        # coalescing. Stored: how many of those became their own normalized
+        # log record (session.sequence advances exactly this many times).
+        # Coalesced: raw observations that were merged into an existing
+        # stored record instead of creating a new one.
+        # raw_events_received == normalized_events_stored + coalesced_events.
+        self.raw_events_received = 0
+        self.normalized_events_stored = 0
+        self.coalesced_events = 0
+        self.last_event_type = None
+        self.last_object_uid = None
 
     def append_event(self, entry):
         self.log.append(entry)
@@ -191,6 +251,13 @@ class RecordingSession(object):
 _state = STATE_STOPPED
 _session = None   # current RecordingSession while RECORDING; last one otherwise
 _last_message = "(no recording session yet)"
+
+# Phase 2.3A session identity maps: transient obj/mesh pointer -> persistent
+# identity.py UID. Rebuilt from the baseline at every Start; see the module
+# docstring ("Session identity maps") for the full rationale, especially
+# why this is required for OBJECT_DELETED to still carry a UID.
+_object_uid_by_pointer = {}
+_mesh_uid_by_pointer = {}
 
 
 def get_state():
@@ -215,6 +282,11 @@ def get_status():
             'last_message': _last_message,
             'started_wall': None,
             'stopped_wall': None,
+            'raw_events': 0,
+            'stored_events': 0,
+            'coalesced_events': 0,
+            'last_event_type': None,
+            'last_object_uid': None,
         }
     elapsed = _session.final_elapsed if _session.final_elapsed is not None else _clock.elapsed()
     return {
@@ -227,6 +299,11 @@ def get_status():
         'last_message': _last_message,
         'started_wall': _session.started_wall,
         'stopped_wall': _session.stopped_wall,
+        'raw_events': _session.raw_events_received,
+        'stored_events': _session.normalized_events_stored,
+        'coalesced_events': _session.coalesced_events,
+        'last_event_type': _session.last_event_type,
+        'last_object_uid': _session.last_object_uid,
     }
 
 
@@ -306,6 +383,75 @@ def _describe_identity_problems(report):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.3A: UID resolution (pointer map first, cheap name fallback second)
+# ---------------------------------------------------------------------------
+
+def _refresh_identity_maps_full():
+    """Cheap, property-reads-only pass refreshing BOTH pointer->UID maps
+    from the live bpy.data.objects/meshes. No geometry is touched.
+
+    Only ever called right after identity.ensure_all_identities(), and
+    only on OBJECT_CREATED events (see module docstring / Phase 2.3A
+    performance requirements) -- never on every event.
+    """
+    for obj in bpy.data.objects:
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            continue
+        uid = identity.get_object_uid(obj)
+        if uid is not None:
+            _object_uid_by_pointer[ptr] = uid
+
+    for mesh in bpy.data.meshes:
+        try:
+            ptr = mesh.as_pointer()
+        except Exception:
+            continue
+        uid = identity.get_mesh_uid(mesh)
+        if uid is not None:
+            _mesh_uid_by_pointer[ptr] = uid
+
+
+def _resolve_object_uid(pointer, name):
+    """Resolution priority: (1) session pointer map -- O(1), works even
+    after the object is deleted; (2) if the object still exists, a cheap
+    direct name lookup + property read (also backfills the map). Returns
+    None if neither resolves (expected for e.g. non-object events).
+    """
+    if pointer is not None and pointer in _object_uid_by_pointer:
+        return _object_uid_by_pointer[pointer]
+    if name:
+        try:
+            obj = bpy.data.objects.get(name)
+        except Exception:
+            obj = None
+        if obj is not None:
+            uid = identity.get_object_uid(obj)
+            if uid is not None and pointer is not None:
+                _object_uid_by_pointer[pointer] = uid
+            return uid
+    return None
+
+
+def _resolve_mesh_uid(pointer, name):
+    """Same priority order as _resolve_object_uid(), for Mesh datablocks."""
+    if pointer is not None and pointer in _mesh_uid_by_pointer:
+        return _mesh_uid_by_pointer[pointer]
+    if name:
+        try:
+            mesh = bpy.data.meshes.get(name)
+        except Exception:
+            mesh = None
+        if mesh is not None:
+            uid = identity.get_mesh_uid(mesh)
+            if uid is not None and pointer is not None:
+                _mesh_uid_by_pointer[pointer] = uid
+            return uid
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Event ingestion (connected to probe.py via the listener hook, not a
 # second handler)
 # ---------------------------------------------------------------------------
@@ -313,50 +459,90 @@ def _describe_identity_problems(report):
 def _on_probe_event(scene, event):
     """Registered with probe.add_event_listener() only while RECORDING.
 
-    Deliberately cheap: at most two bpy.data name lookups (no scene scan,
-    no mesh geometry access -- that work already happened once inside
-    Phase 1's own detection pass before this callback runs at all).
+    Normalizes the raw probe.py/snapshot.py event into the Phase 2.3A
+    event schema (events.py) and runs it through the session's
+    conservative coalescer before deciding whether it becomes a new
+    stored record or is merged into the currently-open one.
+
+    Deliberately cheap for the common case: OBJECT_CREATED is the only
+    event type allowed to run identity.ensure_all_identities() (an
+    O(all objects/meshes), geometry-free repair scan); everything else
+    resolves via an O(1) pointer-map lookup, with at most one cheap
+    name-based fallback lookup on a miss. No scene scan, no mesh
+    geometry access -- that work already happened once inside Phase 1's
+    own detection pass before this callback runs at all.
     """
     if _state != STATE_RECORDING or _session is None:
         return
     try:
-        _session.sequence += 1
-        t = _clock.elapsed()
+        _session.raw_events_received += 1
+
         etype = event.get('type')
+        scene_name = getattr(scene, 'name', None)
         obj_name = event.get('object')
         mesh_name = event.get('mesh_name')
+        object_pointer = event.get('object_pointer')
+        mesh_pointer = event.get('mesh_pointer')
+        payload = event.get('payload') or {}
 
-        obj_uid = None
-        if obj_name:
+        if etype == 'OBJECT_CREATED':
+            # The one case allowed to perform a full, collision-aware
+            # identity repair scan -- see module docstring. This is what
+            # makes a freshly duplicated object (which starts out
+            # holding a *colliding* copy of the original's UID) resolve
+            # to its own, newly-repaired UID rather than the original's.
             try:
-                obj = bpy.data.objects.get(obj_name)
-                if obj is not None:
-                    obj_uid = identity.get_object_uid(obj)
-            except Exception:
-                obj_uid = None
+                identity.ensure_all_identities()
+            except Exception as exc:
+                print(ADDON_TAG + ": identity repair scan failed: %s" % exc)
+            _refresh_identity_maps_full()
+
+        object_uid = None
+        if object_pointer is not None or obj_name:
+            object_uid = _resolve_object_uid(object_pointer, obj_name)
 
         mesh_uid = None
-        if mesh_name:
-            try:
-                mesh = bpy.data.meshes.get(mesh_name)
-                if mesh is not None:
-                    mesh_uid = identity.get_mesh_uid(mesh)
-            except Exception:
-                mesh_uid = None
+        if mesh_pointer is not None or mesh_name:
+            mesh_uid = _resolve_mesh_uid(mesh_pointer, mesh_name)
 
-        counter_key = probe.EVENT_COUNTER_MAP.get(etype)
-        if counter_key:
-            _session.counters[counter_key] = _session.counters.get(counter_key, 0) + 1
+        t = _clock.elapsed()
 
-        _session.append_event({
-            'seq': _session.sequence,
-            't': t,
-            'category': etype,
-            'object_name': obj_name,
-            'object_uid': obj_uid,
-            'mesh_name': mesh_name,
-            'mesh_uid': mesh_uid,
-        })
+        candidate = events.make_event(
+            seq=None,
+            t=t,
+            scene_name=scene_name,
+            etype=etype,
+            object_uid=object_uid,
+            mesh_uid=mesh_uid,
+            object_name=obj_name,
+            mesh_name=mesh_name,
+            payload=payload,
+        )
+
+        stored, was_coalesced = _session.coalescer.offer(candidate)
+
+        if was_coalesced:
+            _session.coalesced_events += 1
+        else:
+            _session.sequence += 1
+            stored['seq'] = _session.sequence
+            _session.append_event(stored)
+            _session.normalized_events_stored += 1
+
+            counter_key = probe.EVENT_COUNTER_MAP.get(etype)
+            if counter_key:
+                _session.counters[counter_key] = _session.counters.get(counter_key, 0) + 1
+
+        _session.last_event_type = etype
+        _session.last_object_uid = object_uid
+
+        # The object is gone -- stop remembering its pointer so it can
+        # never be confused with an unrelated future datablock that
+        # happens to get the same (now-freed) memory address. The mesh
+        # entry is deliberately left alone (see module docstring).
+        if etype == 'OBJECT_DELETED' and object_pointer is not None:
+            _object_uid_by_pointer.pop(object_pointer, None)
+
     except Exception as exc:
         # Never let a bookkeeping error here propagate into probe.py's
         # detection loop (it is already guarded there too, belt-and-braces).
@@ -396,6 +582,21 @@ def start_recording():
         session = RecordingSession()
         session.baseline = _build_baseline()
         session.started_wall = time.time()
+
+        # Phase 2.3A: (re)populate the session identity maps from the
+        # baseline we just captured -- every object/mesh present right
+        # now gets a known pointer->UID entry before a single event can
+        # occur, which is what makes OBJECT_DELETED resolution reliable
+        # even for objects that existed before recording started.
+        _object_uid_by_pointer.clear()
+        _mesh_uid_by_pointer.clear()
+        for scene_data in session.baseline['scenes'].values():
+            for ptr, uid in scene_data['object_uids'].items():
+                if uid is not None:
+                    _object_uid_by_pointer[ptr] = uid
+            for ptr, uid in scene_data['mesh_uids'].items():
+                if uid is not None:
+                    _mesh_uid_by_pointer[ptr] = uid
 
         # Steps 6-8: sequence counter / clock / per-session stats are all
         # fresh because `session` is a brand-new RecordingSession object.
@@ -493,6 +694,8 @@ def shutdown():
         _clock.stop()
     except Exception:
         pass
+    _object_uid_by_pointer.clear()
+    _mesh_uid_by_pointer.clear()
     _state = STATE_STOPPED
 
 

@@ -1,3 +1,95 @@
+## Addendum: Phase 2.3A — Normalized Event Model (`events.py`)
+
+A new, pure-Python (no `bpy` import at all) module, `events.py`, defines a
+**normalized, plain-data event representation** for everything the
+Phase 2.2 recording session observes, plus a small, conservative
+coalescer. **This is still not persistence** — nothing here writes to
+disk; `events.py`/`recording.py` only decide what an in-memory record
+*would* look like if/when a future milestone serializes it.
+
+**Why this was needed:** Phase 2.2's recording session resolved an
+object's identity UID with `bpy.data.objects.get(name)` at event time —
+which cannot work for a deletion, because by the time `OBJECT_DELETED`
+fires the object no longer exists to look up. `events.py` + `recording.py`
+fix this with a stable schema and a session-local resolution scheme (see
+below) so deletions carry a correct, non-null `object_uid` just like
+every other event type.
+
+**Normalized event schema (version 1)** — every stored event is a plain
+dict, safe to `copy.deepcopy()` or eventually serialize, never a `bpy`/RNA
+object:
+```
+{
+    'schema': 1,
+    'seq': <int, increases only for a newly STORED record>,
+    't': <float, recording-relative active seconds, from RecordingClock>,
+    'scene_name': <str or None>,
+    'type': <str, e.g. 'TRANSFORM_CHANGED'>,
+    'object_uid': <str or None>,   # identity.py persistent UID -- the
+    'mesh_uid': <str or None>,     # ONLY fields meaning "same thing over time"
+    'object_name': <str or None>,  # descriptive only, NOT identity
+    'mesh_name': <str or None>,    # descriptive only, NOT identity
+    'payload': { ... type-specific ... },
+    'sample_count': <int, >=1>,
+}
+```
+
+**Transient pointer vs. persistent UID:** `snapshot.diff_snapshots()` now
+additionally includes `object_pointer`/`mesh_pointer` (`obj.as_pointer()`/
+`mesh.as_pointer()`) on every raw event it emits. These are
+**session-local lookup keys only** — never written into a normalized
+event, and never treated as identity. `recording.py` maintains two small
+dicts, `_object_uid_by_pointer`/`_mesh_uid_by_pointer`, populated from the
+baseline at Start and kept current as objects are created, which is what
+lets a deletion event still resolve the correct UID: the pointer was
+recorded *while the object was still alive*, so the lookup works even
+after the object is gone. See `recording.py`'s module docstring ("Session
+identity maps") for the full resolution-priority algorithm, and why only
+`OBJECT_CREATED` is allowed to trigger a full
+`identity.ensure_all_identities()` repair scan (needed so a freshly
+duplicated object — which briefly holds a *colliding* copy of the
+original's UID — resolves to its own, newly-repaired UID).
+
+**Event payloads:** each event type now carries a small, type-specific
+payload built entirely from data `snapshot.py` already computes (no new
+geometry scanning) — e.g. `TRANSFORM_CHANGED` carries `location`/
+`rotation`/`scale`; `OBJECT_RENAMED` carries `old_name`/`new_name`;
+`MESH_GEOMETRY_CHANGED`/`TOPOLOGY_CHANGED` carry the existing mesh
+signature dict. See `snapshot.diff_snapshots()` for the full list.
+
+**Conservative transform coalescing:** a sustained drag fires Phase 1's
+detector many times; without coalescing that would mean one stored event
+per throttled tick. `events.Coalescer` merges **consecutive**
+`TRANSFORM_CHANGED` observations for the **same object** into a single
+stored record as long as each new observation arrives within
+`TRANSFORM_COALESCE_WINDOW` (0.25s, a sliding window) of the previous
+one — preserving the *first* observation's timestamp, keeping the same
+`seq`, replacing the payload with the newest transform, and incrementing
+a `sample_count` field. **Every other event type is always stored
+one-for-one** (creation, deletion, rename, mesh topology/geometry,
+material, modifier, mode, selection, visibility, active-object) — no
+create/delete cancellation, no topology coalescing, no mesh delta
+compression. This is a deliberately safe first policy, not an attempt to
+minimize stored event count aggressively.
+
+**Raw vs. stored vs. coalesced statistics:** `RecordingSession` now
+tracks `raw_events_received` (every detector observation handed to the
+session), `normalized_events_stored` (how many became their own log
+record — this is what `sequence` counts), and `coalesced_events`
+(observations merged into an existing record instead). The existing
+per-category counters (Transform changes, Mesh changes, etc.) now count
+*stored* events, matching `sequence`, not raw detector callbacks.
+
+Explicitly **not** implemented in P2.3A (future work, see
+`docs/Phase2_Architecture.md`): SQLite/`.rm79` persistence, mesh delta or
+full topology serialization, checkpoints, replay reconstruction,
+VirtualScene, camera, FFmpeg, operator-name recording, pause/resume UI.
+
+See `events.py`'s and `recording.py`'s module docstrings for full design
+rationale.
+
+---
+
 ## Addendum: Phase 2.2 — Recording State Machine (`recording.py`)
 
 A new module, `recording.py`, adds a minimal **Start/Stop recording
@@ -137,8 +229,10 @@ ReplayProbe79/
                      (no bpy.context dependency, no Blender handler code)
     identity.py      (Phase 2.1) persistent object/mesh UUIDs via custom
                      ID properties, collision detection/repair
-    recording.py     (Phase 2.2) Start/Stop recording state machine,
-                     in-memory session baseline/clock/event log
+    recording.py     (Phase 2.2/2.3A) Start/Stop recording state machine,
+                     in-memory session baseline/clock, UID resolution
+    events.py        (Phase 2.3A) normalized event schema + conservative
+                     transform coalescing (pure Python, no bpy import)
     ui.py            the diagnostic Panel (Probe status + Recording status)
     README.md        this file
 ```
@@ -216,6 +310,13 @@ Recording Time: ...s
 Sequence: ...
 Events logged: ...
 (status message)
+
+Events (Phase 2.3A)
+Raw events: ...
+Stored events: ...
+Coalesced: ...
+Last event type: ...
+Last object UID: abcd1234...
 
 Recording counters (current/last session):
 ... (same categories as the Probe counters above, scoped to the

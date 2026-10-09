@@ -72,7 +72,7 @@ class REPLAYPROBE79_PT_panel(bpy.types.Panel):
         rec_status = recording.get_status()
 
         rbox = layout.box()
-        rbox.label(text="Recording (Phase 2.2)")
+        rbox.label(text="Recording (Phase 2.2 / 2.3A)")
         row = rbox.row(align=True)
         row.operator("replayprobe79.start_recording", text="Start Recording")
         row.operator("replayprobe79.stop_recording", text="Stop Recording")
@@ -86,6 +86,22 @@ class REPLAYPROBE79_PT_panel(bpy.types.Panel):
         if not rec_status['probe_running'] and rec_status['state'] == recording.STATE_RECORDING:
             rbox.label(text="Warning: Probe is stopped -- no new events "
                              "are being captured!", icon='ERROR')
+
+        # Phase 2.3A -- raw detector observations vs. normalized/stored
+        # events vs. how many were merged by the conservative transform
+        # coalescer. Deliberately just 3 numbers, not a full event dump.
+        rbox3 = layout.box()
+        rbox3.label(text="Events (Phase 2.3A)")
+        rbox3.label(text="Raw events: %d" % rec_status['raw_events'])
+        rbox3.label(text="Stored events: %d" % rec_status['stored_events'])
+        rbox3.label(text="Coalesced: %d" % rec_status['coalesced_events'])
+        last_type = rec_status.get('last_event_type') or "(none)"
+        rbox3.label(text="Last event type: %s" % last_type)
+        last_uid = rec_status.get('last_object_uid')
+        if last_uid:
+            rbox3.label(text="Last object UID: %s..." % last_uid[:8])
+        else:
+            rbox3.label(text="Last object UID: (none)")
 
         rbox2 = layout.box()
         rbox2.label(text="Recording counters (current/last session):")
